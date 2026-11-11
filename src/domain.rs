@@ -53,7 +53,7 @@ impl ToolSelection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Operation { Initialize, Restore, Backup, Install, Update }
+pub(crate) enum Operation { Initialize, Restore, Backup, Install, Update, #[cfg(feature = "test-support")] Probe }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

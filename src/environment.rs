@@ -34,7 +34,7 @@ impl Environment {
     }
 
     pub(crate) fn program(&self, name: &str) -> Result<PathBuf> {
-        if !["rsync", "curl", "mountpoint", "logger", "notify", "update_cron", "sha256sum", "bash", "sh"].contains(&name) { return Err(ManagerError::Rejected("invalid_program", "program is not allowlisted")); }
+        if !["rsync", "curl", "mountpoint", "logger", "notify", "update_cron", "sha256sum", "bash", "sh"].contains(&name) && !(cfg!(feature = "test-support") && self.fixture && name == "probe") { return Err(ManagerError::Rejected("invalid_program", "program is not allowlisted")); }
         if self.fixture {
             let path = self.root.join("bin").join(name);
             if !path.is_file() { return Err(ManagerError::Rejected("missing_dependency", "fixture program is missing")); }
