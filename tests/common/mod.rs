@@ -11,6 +11,51 @@ pub struct Fixture {
     pub directory: tempfile::TempDir,
 }
 impl Fixture {
+    pub fn manager_programs(&self) {
+        for program in ["notify", "logger", "update_cron"] {
+            self.executable(&format!("bin/{program}"), "#!/bin/sh\nexit 0\n");
+        }
+        self.executable("bin/rsync", "#!/bin/sh\nexec /usr/bin/rsync \"$@\"\n");
+        self.executable("bin/bash", "#!/bin/sh\nexec /bin/bash \"$@\"\n");
+        self.executable("bin/sh", "#!/bin/sh\nexec /bin/sh \"$@\"\n");
+        self.write("var/log/plugins/ai-cli-manager.plg", "fixture registration");
+    }
+    pub fn wait(&self, receipt: &Value) -> Value {
+        use std::{
+            thread,
+            time::{Duration, Instant},
+        };
+        let identifier = receipt["job_identifier"]
+            .as_str()
+            .or_else(|| receipt["jobs"][0]["receipt"]["job_identifier"].as_str())
+            .expect("job receipt");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let job = self.json(&["__internal", "job", "--identifier", identifier]);
+            if ["succeeded", "failed", "cancelled"]
+                .contains(&job["state"].as_str().expect("job state"))
+            {
+                return job;
+            }
+            assert!(Instant::now() < deadline, "job did not complete: {job}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    pub fn claude(&self, version: &str) {
+        use std::os::unix::fs::symlink;
+        self.write("root/.claude/settings.json", "{\"userSetting\":42}");
+        self.executable(
+            &format!("root/.local/share/claude/versions/{version}"),
+            &format!("#!/bin/sh\necho '{version} (Claude Code)'\n"),
+        );
+        fs::create_dir_all(self.root().join("root/.local/bin")).expect("launcher directory");
+        symlink(
+            format!("../share/claude/versions/{version}"),
+            self.root().join("root/.local/bin/claude"),
+        )
+        .expect("launcher");
+        self.write("root/.claude-persist-restored", "legacy restore marker");
+    }
     pub fn new() -> Self {
         let directory = tempfile::tempdir_in("/tmp").expect("fixture directory");
         let fixture = Self { directory };

@@ -1,0 +1,33 @@
+Menu="Settings:User Utilities"
+Title="AI CLI Manager"
+Icon="terminal"
+---
+<div id="ai-cli-manager" data-csrf="<?=htmlspecialchars($var['csrf_token'] ?? '', ENT_QUOTES, 'UTF-8')?>">
+<p>Keep root's Claude Code and Codex installations in RAM, with persistent backups in appdata.</p>
+<p>Initialize/Adopt explicitly takes over a tool's legacy schedules. Installing this plugin doesn't enable either tool.</p>
+<p><strong>Desktop preview:</strong> actual Unraid and vendor update-policy validation is pending. Fresh installs and manager updates need an approved release target.</p>
+<label for="backup-interval">Backup interval</label>
+<select id="backup-interval"><option value="5">5 minutes</option><option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">60 minutes</option></select>
+<button type="button" id="save-interval">Save interval</button>
+<div id="manager-message" role="status" aria-live="polite"></div>
+<?php foreach (['claude' => 'Claude Code', 'codex' => 'Codex'] as $tool => $title): ?>
+<fieldset data-tool="<?=$tool?>">
+<legend><?=$title?></legend>
+<label><input type="checkbox" data-setting="enabled"> Enabled</label>
+<label><input type="checkbox" data-setting="automatic_updates"> Automatic updates (daily at 04:00 server time)</label>
+<dl data-status></dl>
+<?php if ($tool === 'codex'): ?>
+<label><input type="checkbox" data-host-consent> For a fresh Codex installation, configure unsandboxed host execution with on-request approvals.</label>
+<?php endif; ?>
+<p>
+<button type="button" data-action="initialize">Initialize/Adopt</button>
+<button type="button" data-action="restore">Restore</button>
+<button type="button" data-action="backup">Backup Now</button>
+<button type="button" data-action="update">Update Now</button>
+</p>
+<p>Authenticate in an Unraid root terminal: <code><?=$tool === 'claude' ? 'claude' : 'codex login'?></code>. Keep tokens out of this page.</p>
+</fieldset>
+<?php endforeach; ?>
+<p>Disabling a tool pauses scheduled operations and preserves its files and native updater policy. Existing processes may need restarting. Running Codex daemons are never restarted here.</p>
+</div>
+<script src="/plugins/ai-cli-manager/scripts/settings.js"></script>

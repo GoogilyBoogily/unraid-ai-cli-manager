@@ -6,7 +6,9 @@
 
 **Architecture:** One synchronous Rust executable runs public CLI requests, short internal Unraid actions, and tracked background jobs. Persistence/tool logic is separate from Unraid schedule, notification, and web integration. PHP validates requests and calls fixed backend actions through argument arrays.
 
-**Tech Stack:** Rust 1.96.0 / edition 2024, Rust tests, PHP, existing rsync/curl, Slackware `.txz`, and Unraid `.plg`. The [eight-crate shortlist](../../context/rust-dependency-shortlist.md), private bundled SQLite, static-musl release target, and revised runtime-tool requirements are pending approval.
+**Tech Stack:** Rust 1.96.0 / edition 2024, Rust tests, PHP, existing rsync/curl, Slackware `.txz`, and Unraid `.plg`. The [eight-crate shortlist](../../context/rust-dependency-shortlist.md), private bundled SQLite, static-musl release target, and revised runtime-tool requirements were approved on 2026-11-11.
+
+**Execution evidence:** [Desktop validation](../../desktop-validation.md) and [implementation ledger](../../implementation-progress.md). Original checklist retained for traceability. Actual server gates remain pending.
 
 **Spec:** [Interview decisions and handoff constraints](../../context/decisions/unraid-ai-cli-manager-decisions.md). Read that record and the dependency proposal before executing this plan.
 

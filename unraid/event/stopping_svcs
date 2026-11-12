@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/local/sbin/ai-cli-manager __internal shutdown

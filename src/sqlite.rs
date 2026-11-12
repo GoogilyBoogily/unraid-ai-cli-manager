@@ -119,3 +119,28 @@ mod tests {
         assert!(!source.exists());
     }
 }
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+    #[test]
+    fn busy_source_fails_within_the_operation_deadline() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let path = directory.path().join("busy.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE state(value); BEGIN EXCLUSIVE; INSERT INTO state VALUES(1)",
+            )
+            .unwrap();
+        let started = Instant::now();
+        let result = backup_database(
+            &path,
+            &directory.path().join("snapshot.sqlite"),
+            started + Duration::from_millis(120),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+}

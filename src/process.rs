@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProcessIdentity {
     pub(crate) identifier: u32,
     pub(crate) start_ticks: u64,
@@ -89,10 +89,9 @@ fn descendants() -> Result<Vec<ProcessIdentity>> {
             .file_name()
             .to_str()
             .and_then(|value| value.parse::<u32>().ok())
+            && let Some(info) = process_info(identifier)?
         {
-            if let Some(info) = process_info(identifier)? {
-                entries.push(info);
-            }
+            entries.push(info);
         }
     }
     let mut owned = HashSet::from([std::process::id()]);
@@ -201,6 +200,19 @@ pub(crate) fn drain_descendants(deadline: Instant) -> Result<()> {
     }
 }
 
+pub(crate) fn finish_children(deadline: Instant) -> Result<()> {
+    loop {
+        reap()?;
+        if descendants()?.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return drain_descendants(deadline);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 pub(crate) struct CommandOutput {
     pub(crate) success: bool,
     pub(crate) stdout: Vec<u8>,
@@ -213,6 +225,7 @@ pub(crate) fn run_path(
     arguments: &[OsString],
     deadline: Instant,
     cancellation: Option<&Path>,
+    home: Option<&Path>,
 ) -> Result<CommandOutput> {
     enable_subreaper()?;
     let mut stdout = tempfile::tempfile().context("cannot create private command output")?;
@@ -232,9 +245,18 @@ pub(crate) fn run_path(
                 .context("cannot duplicate command diagnostics")?,
         )
         .process_group(0);
+    let default_home = environment.path("/root");
+    let home = home.unwrap_or(&default_home);
     command
-        .env("HOME", environment.path("/root"))
-        .env("CODEX_HOME", environment.path("/root/.codex"))
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CODEX_INSTALL_DIR", home.join(".local/bin"))
+        .env("CODEX_NON_INTERACTIVE", "1")
+        .env_remove("CODEX_INSTALL_DAEMON_ONLY")
+        .env_remove("CODEX_INSTALL_DEFER_SELECTION")
+        .env_remove("CODEX_INSTALL_IF_CURRENT")
+        .env_remove("CODEX_INSTALL_IF_LATEST")
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("DISABLE_AUTOUPDATER", "1")
         .env(
             "PATH",
@@ -315,6 +337,7 @@ pub(crate) fn run_checked(
         &environment.program(name)?,
         arguments,
         deadline,
+        None,
         None,
     )?;
     if !output.success {

@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$#" -eq 4 ] || exit 2
+exec /usr/local/sbin/ai-cli-manager __internal plugin-hook "$1" "$2" "$3" "$4"

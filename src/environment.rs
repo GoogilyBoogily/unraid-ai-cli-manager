@@ -77,20 +77,19 @@ impl Environment {
     }
 
     pub(crate) fn program(&self, name: &str) -> Result<PathBuf> {
-        if ![
+        let allowed = [
             "rsync",
             "curl",
             "mountpoint",
             "logger",
             "notify",
             "update_cron",
-            "sha256sum",
             "bash",
             "sh",
         ]
         .contains(&name)
-            && !(cfg!(feature = "test-support") && self.fixture && name == "probe")
-        {
+            || (cfg!(feature = "test-support") && self.fixture && name == "probe");
+        if !allowed {
             return Err(ManagerError::Rejected(
                 "invalid_program",
                 "program is not allowlisted",
@@ -192,12 +191,27 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub(crate) fn replace_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    replace_bytes(path, &serde_json::to_vec(value)?)
+}
+
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    private_directory(
+        path.parent()
+            .ok_or(ManagerError::Rejected("unsafe_path", "file has no parent"))?,
+    )?;
+    replace_bytes(path, bytes)
+}
+
+pub(crate) fn replace_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let parent = path
         .parent()
         .ok_or(ManagerError::Rejected("unsafe_path", "file has no parent"))?;
     let mut temporary =
         tempfile::NamedTempFile::new_in(parent).context("cannot create private temporary file")?;
-    serde_json::to_writer(&mut temporary, value)?;
+    temporary
+        .write_all(bytes)
+        .context("cannot write private temporary file")?;
     temporary
         .as_file()
         .sync_all()

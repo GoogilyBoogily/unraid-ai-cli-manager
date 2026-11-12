@@ -1,0 +1,48 @@
+<?xml version="1.0" standalone="yes"?>
+<PLUGIN name="ai-cli-manager" author="GoogilyBoogily" version="@VERSION@"
+ pluginURL="https://raw.githubusercontent.com/GoogilyBoogily/unraid-ai-cli-manager/main/ai-cli-manager.plg"
+ support="https://github.com/GoogilyBoogily/unraid-ai-cli-manager/issues"
+ launch="Settings/CommandLineTools" icon="terminal">
+<CHANGES>
+### @VERSION@
+Desktop preview: Rust backend, immutable persistence, explicit per-tool migration, tracked jobs, and native settings.
+Server validation is required before approving vendor targets or publishing a beta.
+</CHANGES>
+<FILE Run="/bin/bash" Method="install">
+<INLINE><![CDATA[
+set -euo pipefail
+. /etc/unraid-version
+if [[ ! "$version" =~ ^7\.[0-9]+\.[0-9]+$ ]] || [[ "$(printf '%s\n' 7.3.4 "$version" | sort -V | head -n1)" != 7.3.4 ]]; then
+  echo 'ai-cli-manager requires Unraid 7.3.4 or later in major version 7' >&2
+  exit 1
+fi
+[ "$(uname -m)" = x86_64 ] || exit 1
+for program in rsync curl mountpoint logger update_cron bash sh; do command -v "$program" >/dev/null || { echo "Missing dependency: $program" >&2; exit 1; }; done
+[ -x /usr/local/emhttp/webGui/scripts/notify ] || { echo 'Missing Unraid notification helper' >&2; exit 1; }
+if [ -x /usr/local/sbin/ai-cli-manager ]; then /usr/local/sbin/ai-cli-manager __internal shutdown; fi
+]]></INLINE>
+</FILE>
+<FILE Name="/boot/config/plugins/ai-cli-manager/ai-cli-manager-@VERSION@-x86_64-1.txz" Run="upgradepkg --install-new" Min="7.3.4" Max="7.999.999">
+<URL>https://github.com/GoogilyBoogily/unraid-ai-cli-manager/releases/download/v@VERSION@/ai-cli-manager-@VERSION@-x86_64-1.txz</URL>
+<SHA256>@SHA256@</SHA256>
+</FILE>
+<FILE Run="/bin/bash" Method="install">
+<INLINE><![CDATA[
+set -euo pipefail
+umask 077
+mkdir -p /boot/config/plugins/ai-cli-manager
+chmod 700 /boot/config/plugins/ai-cli-manager
+# Registration happens after this script. The post-hook reconciles cron again.
+if mountpoint -q /mnt/user && [ -d /mnt/user/appdata ]; then
+  /usr/local/sbin/ai-cli-manager __internal event disks_mounted
+fi
+]]></INLINE>
+</FILE>
+<FILE Run="/bin/bash" Method="remove">
+<INLINE><![CDATA[
+set -euo pipefail
+/usr/local/sbin/ai-cli-manager __internal uninstall
+removepkg ai-cli-manager-@VERSION@-x86_64-1
+]]></INLINE>
+</FILE>
+</PLUGIN>

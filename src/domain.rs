@@ -80,6 +80,11 @@ pub(crate) enum ManagerError {
     Database(#[from] rusqlite::Error),
     #[error("invalid TOML configuration")]
     Toml(#[from] toml_edit::TomlError),
+    #[error("{operation}; rollback failed: {rollback}")]
+    Rollback {
+        operation: Box<ManagerError>,
+        rollback: Box<ManagerError>,
+    },
 }
 
 impl ManagerError {
@@ -89,6 +94,16 @@ impl ManagerError {
             Self::Io { .. } => "io_failure",
             Self::Json(_) | Self::Toml(_) => "invalid_data",
             Self::Database(_) => "database_failure",
+            Self::Rollback { .. } => "rollback_failed",
+        }
+    }
+    pub(crate) fn after_rollback(self, rollback: Result<()>) -> Self {
+        match rollback {
+            Ok(()) => self,
+            Err(rollback) => Self::Rollback {
+                operation: Box::new(self),
+                rollback: Box::new(rollback),
+            },
         }
     }
 }
@@ -175,7 +190,7 @@ pub(crate) enum Operation {
     Probe,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ToolSettings {
     pub(crate) enabled: bool,

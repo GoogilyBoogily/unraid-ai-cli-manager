@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
 
+mod configuration;
 mod domain;
 mod environment;
 mod generations;
 mod jobs;
+mod migration;
+mod operations;
 mod process;
 mod sqlite;
 mod tools;
+mod unraid;
 
 use clap::{Parser, Subcommand};
 use domain::{ManagerError, Operation, OperationOutcome, Result, Tool, ToolSelection};
@@ -79,6 +83,28 @@ enum InternalAction {
         #[arg(long)]
         host_execution_opt_in: bool,
     },
+    Settings,
+    Tick {
+        #[arg(long, value_enum)]
+        operation: ScheduledOperation,
+        #[arg(long, value_enum)]
+        tool: Tool,
+    },
+    Event {
+        event: String,
+    },
+    Start,
+    Shutdown {
+        #[arg(long, default_value_t = 120_000)]
+        budget_milliseconds: u64,
+    },
+    Uninstall,
+    PluginHook {
+        kind: String,
+        method: String,
+        plugin: String,
+        error: String,
+    },
     #[cfg(feature = "test-support")]
     Probe {
         #[arg(long, value_enum)]
@@ -88,58 +114,66 @@ enum InternalAction {
     },
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ScheduledOperation {
+    Backup,
+    Update,
+}
+
 fn execute_operation(
     environment: &Environment,
     tool: Tool,
     operation: Operation,
-    _consent: bool,
+    consent: bool,
     deadline: std::time::Instant,
 ) -> Result<OperationOutcome> {
-    #[cfg(feature = "test-support")]
-    if operation == Operation::Probe {
-        process::run_checked(environment, "probe", &[], deadline)?;
-        return Ok(OperationOutcome::unchanged(json!({})));
-    }
-    match operation {
-        Operation::Backup => {
-            let generation = generations::capture(environment, tool, deadline)?;
-            Ok(OperationOutcome::persisted(
-                json!({"generation_identifier":generation.manifest.generation_identifier}),
-            ))
-        }
-        Operation::Restore => generations::restore(environment, tool, deadline),
-        _ => Err(ManagerError::Rejected(
-            "initialization_required",
-            "tool operation is not initialized",
-        )),
-    }
-}
-
-fn read_status(environment: &Environment, selection: ToolSelection) -> Result<Value> {
-    let settings = environment.settings()?;
-    let storage = environment.storage_available()?;
-    let mut tools = serde_json::Map::new();
-    for tool in selection.tools() {
-        let setting = settings.tool(tool);
-        let readiness = if !setting.enabled {
-            "disabled"
-        } else if !storage {
-            "waiting_for_storage"
-        } else if !environment.path(tool.marker()).is_file() {
-            "needs_attention"
-        } else {
-            "ready"
-        };
-        tools.insert(tool.name().to_owned(), json!({"readiness": readiness, "operation": "idle", "restart_required": false, "versions": {"installed": null, "cached": null, "daemon": null}, "last_successful_backup": null, "last_successful_update": null, "errors": []}));
-    }
-    Ok(json!({"schema_version": 1, "tools": tools}))
+    operations::execute(environment, tool, operation, consent, deadline)
 }
 
 fn run(arguments: Arguments) -> Result<Value> {
     let environment = Environment::from_process()?;
     match arguments.command {
-        Action::Status { tool, .. } => read_status(&environment, tool),
+        Action::Status { tool, .. } => operations::status(&environment, tool),
         Action::Internal { action } => match action {
+            InternalAction::Tick { operation, tool } => jobs::scheduled(
+                &environment,
+                tool,
+                match operation {
+                    ScheduledOperation::Backup => Operation::Backup,
+                    ScheduledOperation::Update => Operation::Update,
+                },
+            ),
+            InternalAction::Event { event } => unraid::event(&environment, &event),
+            InternalAction::Start => unraid::start(&environment),
+            InternalAction::Shutdown {
+                budget_milliseconds,
+            } => unraid::shutdown(&environment, budget_milliseconds, false),
+            InternalAction::Uninstall => unraid::shutdown(&environment, 120_000, true),
+            InternalAction::PluginHook {
+                kind,
+                method,
+                plugin,
+                error,
+            } => unraid::plugin_hook(&environment, &kind, &method, &plugin, &error),
+            InternalAction::Settings => {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::io::stdin()
+                    .take(16_385)
+                    .read_to_end(&mut bytes)
+                    .map_err(|source| ManagerError::Io {
+                        context: "cannot read settings request",
+                        source,
+                    })?;
+                if bytes.len() > 16_384 {
+                    return Err(ManagerError::Rejected(
+                        "invalid_settings",
+                        "settings request is too large",
+                    ));
+                }
+                configuration::save_settings(&environment, serde_json::from_slice(&bytes)?)?;
+                Ok(json!({"saved":true}))
+            }
             InternalAction::Supervise { identifier } => jobs::supervise(&environment, &identifier),
             InternalAction::Worker { identifier } => Ok(serde_json::to_value(jobs::worker(
                 &environment,

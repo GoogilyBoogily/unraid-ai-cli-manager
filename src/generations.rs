@@ -113,7 +113,7 @@ impl StorageLease {
         ));
         Ok(Self { directory, anchor })
     }
-    fn root(&self) -> PathBuf {
+    pub(crate) fn root(&self) -> PathBuf {
         self.anchor.clone()
     }
     fn available_bytes(&self) -> Result<u64> {
@@ -156,7 +156,12 @@ fn valid_identifier(identifier: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == b'-')
 }
 
-fn selected(storage: &StorageLease, tool: Tool) -> Result<Option<(PathBuf, Manifest)>> {
+fn selected(
+    environment: &Environment,
+    storage: &StorageLease,
+    tool: Tool,
+    check_databases: bool,
+) -> Result<Option<(PathBuf, Manifest)>> {
     let root = storage.root();
     let target = match fs::read_link(root.join("current")) {
         Ok(target) => target,
@@ -225,8 +230,13 @@ fn selected(storage: &StorageLease, tool: Tool) -> Result<Option<(PathBuf, Manif
             "generation manifest does not match its selector",
         ));
     }
-    tools::validate_payload(&path.join("root"), tool, &manifest.package)?;
-    if tool == Tool::Codex {
+    tools::validate_payload(
+        &path.join("root"),
+        &environment.path("/root"),
+        tool,
+        &manifest.package,
+    )?;
+    if check_databases && tool == Tool::Codex {
         for database in tools::database_paths(&path.join("root/.codex"))? {
             crate::sqlite::validate_database(&database)?;
         }
@@ -236,10 +246,9 @@ fn selected(storage: &StorageLease, tool: Tool) -> Result<Option<(PathBuf, Manif
 
 pub(crate) fn read_current(environment: &Environment, tool: Tool) -> Result<CommittedGeneration> {
     let storage = StorageLease::acquire(environment, tool, false)?;
-    let (path, manifest) = selected(&storage, tool)?.ok_or(ManagerError::Rejected(
-        "missing_generation",
-        "no committed generation exists",
-    ))?;
+    let (path, manifest) = selected(environment, &storage, tool, true)?.ok_or(
+        ManagerError::Rejected("missing_generation", "no committed generation exists"),
+    )?;
     Ok(CommittedGeneration {
         _storage: storage,
         path,
@@ -283,6 +292,28 @@ pub(crate) fn capture(
             "restore marker is missing; refusing backup",
         ));
     }
+    capture_validated_live(environment, tool, deadline)
+}
+
+pub(crate) fn capture_initial(
+    environment: &Environment,
+    tool: Tool,
+    deadline: Instant,
+) -> Result<CommittedGeneration> {
+    if !environment.path(tool.marker()).is_file() && tools::active_tool(environment, tool)? {
+        return Err(ManagerError::Rejected(
+            "needs_attention",
+            "active sessions have no valid initialization marker",
+        ));
+    }
+    capture_validated_live(environment, tool, deadline)
+}
+
+fn capture_validated_live(
+    environment: &Environment,
+    tool: Tool,
+    deadline: Instant,
+) -> Result<CommittedGeneration> {
     let storage = StorageLease::acquire(environment, tool, true)?;
     let selection = tools::inspect_live(environment, tool)?;
     let live = environment.path(tool.live());
@@ -315,7 +346,8 @@ pub(crate) fn capture(
     let root = storage.root();
     private_directory(&root.join("generations"))?;
     private_directory(&root.join(".staging"))?;
-    let previous = selected(&storage, tool)?.map(|entry| entry.1.generation_identifier);
+    let previous =
+        selected(environment, &storage, tool, true)?.map(|entry| entry.1.generation_identifier);
     let staging = tempfile::Builder::new()
         .prefix("generation-")
         .tempdir_in(root.join(".staging"))
@@ -559,7 +591,12 @@ pub(crate) fn restore(
         &[],
         deadline,
     )?;
-    tools::validate_payload(&candidate, tool, &generation.manifest.package)?;
+    tools::validate_payload(
+        &candidate,
+        &environment.path("/root"),
+        tool,
+        &generation.manifest.package,
+    )?;
     write_json(
         &journal_path,
         &json!({"generation_identifier":generation.manifest.generation_identifier}),
@@ -597,6 +634,9 @@ pub(crate) fn restore(
     tools::protect_state(&live)?;
     tools::install_launchers(environment, tool, &generation.manifest.package)?;
     tools::inspect_live(environment, tool)?;
+    let policy = crate::configuration::plan_policy(environment, tool, false)?;
+    crate::configuration::apply_policy(environment, &policy)?;
+    crate::configuration::record_policy(environment, tool)?;
     fs::write(environment.path(tool.marker()), "ai-cli-manager restored\n")
         .context("cannot publish boot restore marker")?;
     Ok(OperationOutcome::persisted(
@@ -637,4 +677,27 @@ fn merge_recovery(candidate: &Path, live_root: &Path, tool: Tool) -> Result<()> 
         fs::write(candidate.join(relative), merged).context("cannot stage merged history")?;
     }
     Ok(())
+}
+
+pub(crate) fn status_summary(environment: &Environment, tool: Tool) -> Result<Value> {
+    let root = environment.path(tool.persistent());
+    if !root.exists() {
+        return Ok(json!({"version":null,"last_backup":null,"last_update":null}));
+    }
+    let storage = StorageLease::acquire(environment, tool, false)?;
+    let generation = selected(environment, &storage, tool, false)?;
+    let mut receipts = Vec::new();
+    for name in ["last-success.json", "last-update.json"] {
+        let receipt = match crate::configuration::read_optional(&storage.root().join(name))? {
+            Some(bytes) => {
+                let value: Value = serde_json::from_slice(&bytes)?;
+                value["completed_at"].as_u64()
+            }
+            None => None,
+        };
+        receipts.push(receipt);
+    }
+    Ok(
+        json!({"version":generation.map(|(_,manifest)|manifest.package.version),"last_backup":receipts[0],"last_update":receipts[1]}),
+    )
 }

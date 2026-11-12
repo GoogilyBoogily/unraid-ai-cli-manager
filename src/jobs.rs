@@ -86,10 +86,28 @@ pub(crate) fn read_job(environment: &Environment, identifier: &str) -> Result<Jo
 }
 
 pub(crate) fn active(environment: &Environment, tool: Tool) -> Result<bool> {
+    let Some(record) = latest(environment, tool)? else {
+        return Ok(false);
+    };
+    if ![JobState::Queued, JobState::Running, JobState::Cancelling].contains(&record.state) {
+        return Ok(false);
+    }
+    if let Some(supervisor) = &record.supervisor
+        && !process::alive(supervisor)?
+    {
+        return Err(ManagerError::Rejected(
+            "needs_attention",
+            "previous job supervisor was lost; verify its workers before starting more work",
+        ));
+    }
+    Ok(true)
+}
+
+pub(crate) fn latest(environment: &Environment, tool: Tool) -> Result<Option<JobRecord>> {
     let path = directory(environment).join(format!("{}.active", tool.name()));
     let identifier = match fs::read_to_string(path) {
         Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(ManagerError::Io {
                 context: "cannot read active job selector",
@@ -98,13 +116,13 @@ pub(crate) fn active(environment: &Environment, tool: Tool) -> Result<bool> {
         }
     };
     let record = read_job(environment, &identifier)?;
-    if ![JobState::Queued, JobState::Running, JobState::Cancelling].contains(&record.state) {
-        return Ok(false);
+    if record.tool != tool {
+        return Err(ManagerError::Rejected(
+            "invalid_job",
+            "job tool selector does not match",
+        ));
     }
-    if let Some(supervisor) = &record.supervisor {
-        return process::alive(supervisor);
-    }
-    Ok(true)
+    Ok(Some(record))
 }
 
 pub(crate) fn submit(
@@ -114,8 +132,52 @@ pub(crate) fn submit(
     consent: bool,
     timeout_milliseconds: u64,
 ) -> Result<Value> {
+    submit_inner(
+        environment,
+        tool,
+        operation,
+        consent,
+        timeout_milliseconds,
+        false,
+        false,
+    )
+}
+
+pub(crate) fn scheduled(
+    environment: &Environment,
+    tool: Tool,
+    operation: Operation,
+) -> Result<Value> {
+    submit_inner(environment, tool, operation, false, 600_000, false, true)
+}
+
+pub(crate) fn final_backup(
+    environment: &Environment,
+    tool: Tool,
+    timeout_milliseconds: u64,
+) -> Result<Value> {
+    submit_inner(
+        environment,
+        tool,
+        Operation::Backup,
+        false,
+        timeout_milliseconds,
+        true,
+        false,
+    )
+}
+
+fn submit_inner(
+    environment: &Environment,
+    tool: Tool,
+    operation: Operation,
+    consent: bool,
+    timeout_milliseconds: u64,
+    final_backup: bool,
+    scheduled: bool,
+) -> Result<Value> {
     let _admission = lock_file(&environment.path("/run/ai-cli-manager/admission.lock"))?;
-    if environment.path("/run/ai-cli-manager/stopping").exists() {
+    if !final_backup && environment.path("/run/ai-cli-manager/stopping").exists() {
         return Err(ManagerError::Rejected(
             "stopping",
             "manager is rejecting work while the array stops",
@@ -127,8 +189,26 @@ pub(crate) fn submit(
             "another job is active for this tool",
         ));
     }
-    let _tool_lock = lock_file(&environment.path(tool.lock()))?;
+    let _tool_lock = match lock_file(&environment.path(tool.lock())) {
+        Ok(lock) => Some(lock),
+        Err(ManagerError::Rejected("busy", _)) if operation == Operation::Initialize => None,
+        Err(error) => return Err(error),
+    };
     let settings = environment.settings()?;
+    if operation != Operation::Initialize && crate::migration::recovery_required(environment, tool)?
+    {
+        return Err(ManagerError::Rejected(
+            "migration_recovery_required",
+            "recover the interrupted migration through Initialize/Adopt before starting other jobs",
+        ));
+    }
+    if scheduled
+        && (!settings.tool(tool).enabled
+            || !settings.tool(tool).initialized
+            || (operation == Operation::Update && !settings.tool(tool).automatic_updates))
+    {
+        return Ok(json!({"skipped":"disabled"}));
+    }
     if !settings.tool(tool).initialized && operation != Operation::Initialize {
         #[cfg(feature = "test-support")]
         if operation != Operation::Probe {
@@ -203,8 +283,25 @@ pub(crate) fn supervise(environment: &Environment, identifier: &str) -> Result<V
     let mut record = read_job(environment, identifier)?;
     record.supervisor = Some(process::identity(std::process::id())?);
     write_json(&record_path(environment, identifier)?, &record)?;
-    let startup_deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_millis(record.timeout_milliseconds);
+    let startup_deadline = deadline.min(
+        Instant::now()
+            + Duration::from_secs(if record.operation == Operation::Initialize {
+                60
+            } else {
+                2
+            }),
+    );
+    let cancellation = directory(environment).join(format!("{identifier}.cancel"));
     let tool_lock = loop {
+        if cancellation.exists() {
+            record.state = JobState::Cancelled;
+            record.error_code = Some("cancelled".to_owned());
+            record.error_message =
+                Some("queued job cancelled before acquiring its lock".to_owned());
+            write_json(&record_path(environment, identifier)?, &record)?;
+            return Ok(json!({"state":record.state}));
+        }
         match lock_file(&environment.path(record.tool.lock())) {
             Ok(lock) => break lock,
             Err(ManagerError::Rejected("busy", _)) if Instant::now() < startup_deadline => {
@@ -221,8 +318,6 @@ pub(crate) fn supervise(environment: &Environment, identifier: &str) -> Result<V
     };
     record.state = JobState::Running;
     write_json(&record_path(environment, identifier)?, &record)?;
-    let deadline = Instant::now() + Duration::from_millis(record.timeout_milliseconds);
-    let cancellation = directory(environment).join(format!("{identifier}.cancel"));
     let output = process::run_path(
         environment,
         &std::env::current_exe().context("cannot locate manager worker")?,
@@ -234,7 +329,25 @@ pub(crate) fn supervise(environment: &Environment, identifier: &str) -> Result<V
         ],
         deadline,
         Some(&cancellation),
+        None,
     );
+    if output
+        .as_ref()
+        .is_err_and(|error| error.code() == "descendants_alive")
+    {
+        record.state = JobState::Cancelling;
+        record.error_code = Some("descendants_alive".to_owned());
+        record.error_message = Some("waiting for owned descendants to exit".to_owned());
+        write_json(&record_path(environment, identifier)?, &record)?;
+        // Keep the legacy lock while a kernel-blocked writer can still touch storage.
+        loop {
+            match process::drain_descendants(Instant::now() + Duration::from_secs(1)) {
+                Ok(()) => break,
+                Err(error) if error.code() == "descendants_alive" => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
     let completion: std::result::Result<OperationOutcome, SafeFailure> = match output {
         Ok(output) if output.success => {
             serde_json::from_slice(&output.stdout).map_err(|error| SafeFailure {
@@ -280,14 +393,31 @@ pub(crate) fn supervise(environment: &Environment, identifier: &str) -> Result<V
             record.result = Some(result);
         }
         Err(failure) => {
+            let cancelled = failure.code == "cancelled";
             record.error_code = Some(failure.code);
             record.error_message = Some(failure.message);
-            record.state = JobState::Failed;
+            record.state = if cancelled {
+                JobState::Cancelled
+            } else {
+                JobState::Failed
+            };
         }
     }
     drop(tool_lock);
     write_json(&record_path(environment, identifier)?, &record)?;
+    crate::unraid::notify_job(environment, &record)?;
     Ok(json!({"state": record.state}))
+}
+
+pub(crate) fn cancel(environment: &Environment, tool: Tool) -> Result<()> {
+    if active(environment, tool)? {
+        let record = latest(environment, tool)?.expect("active job");
+        crate::environment::write_bytes(
+            &directory(environment).join(format!("{}.cancel", record.job_identifier)),
+            b"cancel\n",
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn worker(environment: &Environment, identifier: &str) -> Result<OperationOutcome> {

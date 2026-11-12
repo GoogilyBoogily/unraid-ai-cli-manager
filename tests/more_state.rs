@@ -48,3 +48,32 @@ fn dangling_required_configuration_link_blocks_backup() {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+#[test]
+fn missing_marker_source_package_or_dependency_cannot_publish() {
+    for missing in ["marker", "source", "package", "dependency"] {
+        let fixture = common::Fixture::new();
+        fixture.mount();
+        fixture.manager_programs();
+        fixture.claude("1.0.0");
+        let path = match missing {
+            "marker" => "root/.claude-persist-restored",
+            "source" => "root/.claude",
+            "package" => "root/.local/share/claude/versions/1.0.0",
+            _ => "bin/rsync",
+        };
+        fs::rename(
+            fixture.root().join(path),
+            fixture.root().join("held-out-fixture-entry"),
+        )
+        .unwrap();
+        let job = fixture.wait(&fixture.json(&["backup", "--tool", "claude"]));
+        assert_eq!(job["state"], "failed", "{missing}: {job}");
+        assert!(
+            !fixture
+                .root()
+                .join("mnt/user/appdata/claude-code/current")
+                .exists()
+        );
+    }
+}

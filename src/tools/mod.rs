@@ -48,8 +48,14 @@ fn executable(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn inspect_live(environment: &Environment, tool: Tool) -> Result<PackageSelection> {
-    let root = environment.path("/root");
-    let live = environment.path(tool.live());
+    inspect_root(&environment.path("/root"), tool)
+}
+
+pub(crate) fn inspect_root(root: &Path, tool: Tool) -> Result<PackageSelection> {
+    let live = root.join(match tool {
+        Tool::Claude => ".claude",
+        Tool::Codex => ".codex",
+    });
     if !fs::symlink_metadata(&live)
         .context("live source is missing")?
         .is_dir()
@@ -59,12 +65,13 @@ pub(crate) fn inspect_live(environment: &Environment, tool: Tool) -> Result<Pack
             "live source must be a real RAM directory",
         ));
     }
-    let selected = environment
-        .path(tool.launcher())
+    let selected = root
+        .join(".local/bin")
+        .join(tool.name())
         .canonicalize()
         .context("tool launcher is missing or broken")?;
     let relative_executable = selected
-        .strip_prefix(&root)
+        .strip_prefix(root)
         .map_err(|_| {
             ManagerError::Rejected(
                 "invalid_package",
@@ -107,12 +114,13 @@ pub(crate) fn inspect_live(environment: &Environment, tool: Tool) -> Result<Pack
         version,
         relative_executable,
     };
-    validate_payload(&root, tool, &selection)?;
+    validate_payload(root, root, tool, &selection)?;
     Ok(selection)
 }
 
 pub(crate) fn validate_payload(
     root: &Path,
+    live_root: &Path,
     tool: Tool,
     selection: &PackageSelection,
 ) -> Result<()> {
@@ -137,7 +145,31 @@ pub(crate) fn validate_payload(
             }
         };
         if metadata.file_type().is_symlink() {
-            if !path
+            let target =
+                fs::read_link(&path).context("cannot inspect external configuration link")?;
+            let target = if target.is_absolute() {
+                if target.starts_with(live_root.join(tool.live().trim_start_matches("/root/"))) {
+                    root.join(
+                        target
+                            .strip_prefix(live_root)
+                            .expect("managed state target"),
+                    )
+                } else {
+                    target
+                }
+            } else if path
+                .try_exists()
+                .context("cannot inspect staged configuration target")?
+            {
+                path.clone()
+            } else {
+                live_root
+                    .join(relative)
+                    .parent()
+                    .expect("configuration parent")
+                    .join(target)
+            };
+            if !target
                 .try_exists()
                 .context("cannot inspect external configuration target")?
             {
@@ -320,6 +352,7 @@ pub(crate) fn database_paths(root: &Path) -> Result<Vec<PathBuf>> {
             }
         }
     }
+    databases.sort();
     Ok(databases)
 }
 
@@ -331,19 +364,45 @@ pub(crate) fn capture(
 ) -> Result<PackageSelection> {
     let selection = inspect_live(environment, tool)?;
     let root = environment.path("/root");
+    let live = environment.path(tool.live());
+    let mut runtime_exclusions = Vec::new();
+    for path in walk(&live)? {
+        if fs::symlink_metadata(&path)
+            .context("cannot inspect runtime link")?
+            .file_type()
+            .is_symlink()
+        {
+            let target = fs::read_link(&path).context("cannot inspect runtime link target")?;
+            if target.starts_with(environment.path("/tmp"))
+                || target.starts_with(environment.path("/run"))
+                || (environment.fixture
+                    && !target.starts_with(environment.path("/"))
+                    && (target.starts_with("/tmp") || target.starts_with("/run")))
+            {
+                runtime_exclusions
+                    .push(exclude_path(path.strip_prefix(&live).expect("live link"))?);
+            }
+        }
+    }
     match tool {
         Tool::Claude => {
+            let mut exclusions = vec![
+                "/shell-snapshots/",
+                "/session-env/",
+                "/cache/",
+                "/downloads/",
+                "/paste-cache/",
+                "*.pid",
+                "*.sock",
+                "*.lock",
+                "*.lock.d",
+            ];
+            exclusions.extend(runtime_exclusions.iter().map(String::as_str));
             transfer(
                 environment,
                 &root.join(".claude"),
                 &destination.join(".claude"),
-                &[
-                    "/shell-snapshots/",
-                    "/session-env/",
-                    "/cache/",
-                    "/downloads/",
-                    "/paste-cache/",
-                ],
+                &exclusions,
                 deadline,
             )?;
             let configuration = root.join(".claude.json");
@@ -372,29 +431,21 @@ pub(crate) fn capture(
                 "*-journal",
                 "*.pid",
                 "*.sock",
+                "*.lock",
+                "*.lock.d",
                 "install.lock",
                 "install.lock.d",
             ]
             .iter()
             .map(|value| (*value).to_owned())
             .collect();
+            exclusions.extend(runtime_exclusions);
             for database in &databases {
-                let relative = database
-                    .strip_prefix(root.join(".codex"))
-                    .expect("database is rooted")
-                    .to_str()
-                    .ok_or(ManagerError::Rejected(
-                        "invalid_state",
-                        "database path is not UTF-8",
-                    ))?;
-                let mut escaped = String::from("/");
-                for character in relative.chars() {
-                    if ['\\', '[', ']', '*', '?'].contains(&character) {
-                        escaped.push('\\');
-                    }
-                    escaped.push(character);
-                }
-                exclusions.push(escaped);
+                exclusions.push(exclude_path(
+                    database
+                        .strip_prefix(root.join(".codex"))
+                        .expect("database is rooted"),
+                )?);
             }
             transfer(
                 environment,
@@ -403,17 +454,58 @@ pub(crate) fn capture(
                 &exclusions.iter().map(String::as_str).collect::<Vec<_>>(),
                 deadline,
             )?;
-            for source in databases {
+            if database_paths(&root.join(".codex"))? != databases {
+                return Err(ManagerError::Rejected(
+                    "database_set_changed",
+                    "database inventory changed during backup; retry with a stable inventory",
+                ));
+            }
+            for source in &databases {
                 let relative = source
                     .strip_prefix(&root)
                     .expect("database within live root");
-                sqlite::backup_database(&source, &destination.join(relative), deadline)?;
+                sqlite::backup_database(source, &destination.join(relative), deadline)?;
+            }
+            let expected: Vec<_> = databases
+                .iter()
+                .map(|path| path.strip_prefix(&root).expect("database root").to_owned())
+                .collect();
+            let captured: Vec<_> = database_paths(&destination.join(".codex"))?
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(destination)
+                        .expect("snapshot database root")
+                        .to_owned()
+                })
+                .collect();
+            if database_paths(&root.join(".codex"))? != databases || expected != captured {
+                return Err(ManagerError::Rejected(
+                    "database_set_changed",
+                    "database inventory changed during backup; retry with a stable inventory",
+                ));
+            }
+            for path in walk(&root.join(".codex"))? {
+                if path.is_symlink()
+                    && path.extension().is_some_and(|extension| {
+                        ["sqlite", "sqlite3", "db"]
+                            .iter()
+                            .any(|suffix| extension == *suffix)
+                    })
+                {
+                    let relative = path
+                        .strip_prefix(root.join(".codex"))
+                        .expect("live database link");
+                    let excluded = exclude_path(relative)?;
+                    if !exclusions.contains(&excluded) {
+                        copy_entry(&path, &destination.join(".codex").join(relative))?;
+                    }
+                }
             }
         }
     }
     normalize_package_links(&root, destination, tool)?;
     protect_state(destination)?;
-    validate_payload(destination, tool, &selection)?;
+    validate_payload(destination, &root, tool, &selection)?;
     if inspect_live(environment, tool)? != selection {
         return Err(ManagerError::Rejected(
             "package_changed",
@@ -545,7 +637,33 @@ pub(crate) fn install_launchers(
     tool: Tool,
     selection: &PackageSelection,
 ) -> Result<()> {
+    validate_payload(
+        &environment.path("/root"),
+        &environment.path("/root"),
+        tool,
+        selection,
+    )?;
     private_directory(&environment.path("/root/.local/bin"))?;
+    if tool == Tool::Codex {
+        let release = environment
+            .path("/root")
+            .join(&selection.relative_executable)
+            .parent()
+            .and_then(Path::parent)
+            .ok_or(ManagerError::Rejected(
+                "invalid_package",
+                "Codex release directory is missing",
+            ))?
+            .to_owned();
+        replace_link(
+            &release,
+            &environment.path("/root/.codex/packages/standalone/current"),
+        )?;
+        replace_link(
+            &release.join("bin/codex-code-mode-host"),
+            &environment.path("/root/.local/bin/codex-code-mode-host"),
+        )?;
+    }
     for path in [
         environment.path(tool.launcher()),
         environment.path(format!("/usr/local/bin/{}", tool.name())),
@@ -567,6 +685,17 @@ pub(crate) fn install_launchers(
         fs::rename(staged, path).context("cannot select tool launcher")?;
     }
     Ok(())
+}
+
+fn replace_link(target: &Path, path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or(ManagerError::Rejected("unsafe_path", "link has no parent"))?;
+    fs::create_dir_all(parent).context("cannot create launcher parent")?;
+    let temporary = tempfile::tempdir_in(parent).context("cannot stage package selector")?;
+    let staged = temporary.path().join("link");
+    symlink(target, &staged).context("cannot stage package selector")?;
+    fs::rename(staged, path).context("cannot publish package selector")
 }
 
 pub(crate) fn merge_json(
@@ -601,10 +730,18 @@ pub(crate) fn merge_history(persisted: &str, live: &str) -> String {
 }
 
 pub(crate) fn active_tool(environment: &Environment, tool: Tool) -> Result<bool> {
+    Ok(!running_processes(environment, tool)?.is_empty())
+}
+
+pub(crate) fn running_processes(
+    environment: &Environment,
+    tool: Tool,
+) -> Result<Vec<(crate::process::ProcessIdentity, PathBuf)>> {
     let prefix = match tool {
         Tool::Claude => environment.path("/root/.local/share/claude"),
         Tool::Codex => environment.path("/root/.codex/packages"),
     };
+    let mut processes = Vec::new();
     for entry in fs::read_dir("/proc").context("cannot inspect active tool processes")? {
         let entry = entry.context("cannot inspect process entry")?;
         if entry
@@ -622,7 +759,18 @@ pub(crate) fn active_tool(environment: &Environment, tool: Tool) -> Result<bool>
             continue;
         }
         match fs::read_link(entry.path().join("exe")) {
-            Ok(executable) if executable.starts_with(&prefix) => return Ok(true),
+            Ok(executable) if executable.starts_with(&prefix) => {
+                let identifier = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                    .expect("numeric process directory");
+                match crate::process::identity(identifier) {
+                    Ok(identity) => processes.push((identity, executable)),
+                    Err(error) if error.code() == "process_gone" => {}
+                    Err(error) => return Err(error),
+                }
+            }
             Ok(_) => {}
             Err(error)
                 if [
@@ -638,5 +786,20 @@ pub(crate) fn active_tool(environment: &Environment, tool: Tool) -> Result<bool>
             }
         }
     }
-    Ok(false)
+    Ok(processes)
+}
+
+fn exclude_path(relative: &Path) -> Result<String> {
+    let relative = relative.to_str().ok_or(ManagerError::Rejected(
+        "invalid_state",
+        "state path is not UTF-8",
+    ))?;
+    let mut escaped = String::from("/");
+    for character in relative.chars() {
+        if ['\\', '[', ']', '*', '?'].contains(&character) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    Ok(escaped)
 }
