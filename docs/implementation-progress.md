@@ -19,3 +19,11 @@ User authorization: Unsigned task commits are permitted for this repository afte
 Task 2 evidence: The detached-writer and busy-job tests were RED before implementation. Both now pass. The timeout trace showed zombie descendants because rustix waitpid(None) only reaps the current process group. Switching to wait() reaps adopted children across groups; the original test now passes unchanged. Also reserve time for KILL inside short injected deadlines.
 
 Ruling: Common lock parents such as /var/run must keep their existing permissions. Only manager-owned directories get private_directory permissions.
+
+2026-11-12 resume: Full current suite passes 16 tests. Snapshot capture/publication, retention, pinned filesystem handles, sensitive permissions, SQLite/WAL backup, cold restore, and required external-link failures are implemented. Remaining plan edge cases and full lint remain open, so the plan tasks aren't falsely marked complete.
+
+The checked storage lease now pins the tool root as well as appdata. Atomic success receipts use the already checked directory, avoiding a fresh rootfs pathname lookup. Job states and installation/persistence outcomes are typed enums. Malformed/crashed worker responses become explicit failed jobs.
+
+Build tooling: sudo required a password. The approved PHP/musl packages were downloaded and extracted only under /tmp/ai-cli-manager-build-tools. PHP CLI runs there. Rust's musl target is installed. No production tool or data was touched.
+
+Ruling: Keep the shipped approved-vendor catalog empty until actual server validation exists. Synthetic fixture catalogs exercise installs/updates. Cost: production fresh installs and manager updates need a reviewed target added after server review; existing valid installations can still be adopted and persisted.
